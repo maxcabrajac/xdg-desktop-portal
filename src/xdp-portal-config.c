@@ -51,8 +51,12 @@ struct _XdpPortalConfig
   GObject parent_instance;
 
   char **current_desktops;
+
+  // GPtrArray of XdpImplConfig
   GPtrArray *impl_configs;
-  PortalConfig *config;
+
+  // GPtrArray of PortalConfig
+  GPtrArray *configs;
 };
 
 G_DEFINE_FINAL_TYPE (XdpPortalConfig, xdp_portal_config, G_TYPE_OBJECT)
@@ -510,16 +514,19 @@ load_config_directory (const char  *dir,
   return NULL;
 }
 
-static PortalConfig *
-load_portal_configuration (XdpPortalConfig *portal_config,
-                           gboolean        opt_verbose)
+static GPtrArray *
+load_portal_configurations (XdpPortalConfig *portal_config,
+                            gboolean        opt_verbose)
 {
+  g_autoptr(GPtrArray) configs = NULL;
   g_autoptr(PortalConfig) config = NULL;
   g_autofree char *user_portal_dir = NULL;
   const char * const *dirs;
   const char * const *iter;
   const char **desktops;
   const char *portal_dir;
+
+  configs = g_ptr_array_new_with_free_func ((GDestroyNotify) portal_config_free);
 
   desktops = xdp_portal_config_get_current_desktops (portal_config);
 
@@ -528,8 +535,11 @@ load_portal_configuration (XdpPortalConfig *portal_config,
 
   if (portal_dir != NULL)
     {
+      config = load_config_directory (portal_dir, desktops, opt_verbose);
+      if (config)
+        g_ptr_array_add (configs, g_steal_pointer (&config));
       /* All other config directories are ignored when this is set */
-      return load_config_directory (portal_dir, desktops, opt_verbose);
+      return g_steal_pointer (&configs);
     }
 
   /* $XDG_CONFIG_HOME/xdg-desktop-portal/(DESKTOP-)portals.conf */
@@ -537,7 +547,7 @@ load_portal_configuration (XdpPortalConfig *portal_config,
 
   config = load_config_directory (user_portal_dir, desktops, opt_verbose);
   if (config)
-    return g_steal_pointer (&config);
+    g_ptr_array_add (configs, g_steal_pointer (&config));
 
   /* $XDG_CONFIG_DIRS/xdg-desktop-portal/(DESKTOP-)portals.conf */
   dirs = g_get_system_config_dirs ();
@@ -548,13 +558,13 @@ load_portal_configuration (XdpPortalConfig *portal_config,
 
       config = load_config_directory (dir, desktops, opt_verbose);
       if (config)
-        return g_steal_pointer (&config);
+        g_ptr_array_add (configs, g_steal_pointer (&config));
     }
 
   /* ${sysconfdir}/xdg-desktop-portal/(DESKTOP-)portals.conf */
   config = load_config_directory (SYSCONFDIR "/" XDP_SUBDIR, desktops, opt_verbose);
   if (config)
-    return g_steal_pointer (&config);
+    g_ptr_array_add (configs, g_steal_pointer (&config));
 
 
   /* $XDG_DATA_HOME/xdg-desktop-portal/(DESKTOP-)portals.conf
@@ -564,7 +574,7 @@ load_portal_configuration (XdpPortalConfig *portal_config,
 
   config = load_config_directory (user_portal_dir, desktops, opt_verbose);
   if (config)
-    return g_steal_pointer (&config);
+    g_ptr_array_add (configs, g_steal_pointer (&config));
 
   /* $XDG_DATA_DIRS/xdg-desktop-portal/(DESKTOP-)portals.conf */
   dirs = g_get_system_data_dirs ();
@@ -575,15 +585,15 @@ load_portal_configuration (XdpPortalConfig *portal_config,
 
       config = load_config_directory (dir, desktops, opt_verbose);
       if (config)
-        return g_steal_pointer (&config);
+        g_ptr_array_add (configs, g_steal_pointer (&config));
     }
 
   /* ${datadir}/xdg-desktop-portal/(DESKTOP-)portals.conf */
   config = load_config_directory (DATADIR "/" XDP_SUBDIR, desktops, opt_verbose);
   if (config)
-    return g_steal_pointer (&config);
+    g_ptr_array_add (configs, g_steal_pointer (&config));
 
-  return NULL;
+  return g_steal_pointer (&configs);
 }
 
 static void
@@ -593,7 +603,7 @@ xdp_portal_config_dispose (GObject *object)
 
   g_clear_pointer (&portal_config->current_desktops, g_strfreev);
   g_clear_pointer (&portal_config->impl_configs, g_ptr_array_unref);
-  g_clear_pointer (&portal_config->config, portal_config_free);
+  g_clear_pointer (&portal_config->configs, g_ptr_array_unref);
 
   G_OBJECT_CLASS (xdp_portal_config_parent_class)->dispose (object);
 }
@@ -619,7 +629,7 @@ xdp_portal_config_new (XdpContext *context)
 
   portal_config->current_desktops = get_current_lowercase_desktops ();
   portal_config->impl_configs = load_installed_portals (portal_config, opt_verbose);
-  portal_config->config = load_portal_configuration (portal_config, opt_verbose);
+  portal_config->configs = load_portal_configurations (portal_config, opt_verbose);
 
   return portal_config;
 }
@@ -857,10 +867,12 @@ xdp_portal_config_find (XdpPortalConfig *portal_config,
   const char **desktops = xdp_portal_config_get_current_desktops (portal_config);
   PortalInterface *iface = NULL;
   XdpImplConfig *impl_config = NULL;
-  PortalConfig *config = portal_config->config;
+  GPtrArray *configs = portal_config->configs;
 
-  if (config != NULL)
+  for (size_t i = 0; i < configs->len; i++)
     {
+      PortalConfig *config = g_ptr_array_index (configs, i);
+
       if (portal_config_interface_prefers_none (config, interface))
         return NULL;
 
@@ -928,12 +940,15 @@ xdp_portal_config_find_all (XdpPortalConfig *portal_config,
   PortalInterface *iface;
   XdpImplConfig *impl_config;
   g_autoptr(GPtrArray) impls_out = NULL;
-  PortalConfig *config = portal_config->config;
+  GPtrArray *configs = portal_config->configs;
 
   impls_out = g_ptr_array_new ();
 
-  if (config != NULL)
+  for (size_t i = 0; i < configs->len; i++)
     {
+      PortalConfig *config = g_ptr_array_index (configs, i);
+      size_t prev_impl_count = impls_out->len;
+
       if (portal_config_interface_prefers_none (config, interface))
         return g_steal_pointer (&impls_out);
 
@@ -943,7 +958,7 @@ xdp_portal_config_find_all (XdpPortalConfig *portal_config,
                                                     interface,
                                                     impls_out);
 
-      if (impls_out->len > 0)
+      if (impls_out->len > prev_impl_count)
         return g_steal_pointer (&impls_out);
 
       iface = config->default_portal;
@@ -951,7 +966,7 @@ xdp_portal_config_find_all (XdpPortalConfig *portal_config,
                                                     iface,
                                                     interface,
                                                     impls_out);
-      if (impls_out->len > 0)
+      if (impls_out->len > prev_impl_count)
         return g_steal_pointer (&impls_out);
     }
 
